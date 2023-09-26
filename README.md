@@ -18,7 +18,7 @@ Its path is found in all the folders that are specified in your system's `%PATH%
 
 You need to compile it:
 ```
-clang++ -std=c++20 .\win-nvim-qt-adapter.cpp -lshell32 -lshlwapi -o win-nvim-qt-adapter.exe
+clang++ -std=c++20 -O3 .\win-nvim-qt-adapter.cpp -lshell32 -lshlwapi -o win-nvim-qt-adapter.exe
 ```
 
 This program may also be compiled with `cl.exe` from Microsoft, but you should figure it out yourself, because I'm not that familiar with its command line interface.

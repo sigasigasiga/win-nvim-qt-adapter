@@ -3,58 +3,40 @@
 // terms of the Do What The Fuck You Want To Public License, Version 2,
 // as published by Sam Hocevar. See the COPYING file for more details.
 
-#include <codecvt>
 #include <format>
-#include <iomanip>
 #include <iostream>
-#include <locale>
 #include <ranges>
 #include <span>
 
-#include <windows.h>
 #include <shlwapi.h>
+#include <windows.h>
 
-template<typename T, bool round_brackets = true>
-class construct_t
-{
-public:
-    template<typename... Args>
-    T operator()(Args&&... args) const
-    {
-        if constexpr(round_brackets) {
-            return T(std::forward<Args>(args)...);
-        } else {
-            return T{std::forward<Args>(args)...};
-        }
-    }
-};
+std::error_code make_sys_ec(int ec) {
+    return std::error_code{ec, std::system_category()};
+}
 
-class local_free_t
-{
-public:
-    void operator()(void* ptr) const
-    {
-        ::LocalFree(ptr);
-    }
-};
-
-std::error_code make_ec(int ec = static_cast<int>(::GetLastError()))
-{
-    return std::error_code{static_cast<int>(ec), std::system_category()};
+std::error_code make_sys_ec(DWORD ec = ::GetLastError()) {
+    return make_sys_ec(static_cast<int>(ec));
 }
 
 class errno_exception_t : public std::system_error
 {
 public:
     errno_exception_t() : errno_exception_t{::GetLastError()} {}
-    errno_exception_t(DWORD ec) : std::system_error{make_ec(static_cast<int>(ec))} {}
+    errno_exception_t(DWORD ec) : std::system_error{make_sys_ec(ec)} {}
+};
+
+class local_free_t
+{
+public:
+    void operator()(void *ptr) const { ::LocalFree(ptr); }
 };
 
 class argv_t
 {
 public:
     [[nodiscard]] argv_t(std::wstring_view cmd)
-        : argv_{::CommandLineToArgvW(cmd.data(), &argc_)}
+        : argv_{::CommandLineToArgvW(cmd.data(), &argc_)} //
     {
         if(argv_ == nullptr || argc_ < 0) {
             throw errno_exception_t{};
@@ -62,32 +44,28 @@ public:
     }
 
 public:
-    auto raw_span() const
-    {
-        return std::span<const wchar_t* const>{argv_.get(), static_cast<std::size_t>(argc_)};
-    }
-
-    auto sv_span() const
-    {
-        return raw_span() | std::views::transform(construct_t<std::wstring_view>{});
+    auto get_span() const {
+        return std::span<const wchar_t *const>{
+            argv_.get(),
+            static_cast<std::size_t>(argc_)
+        };
     }
 
 private:
     int argc_;
-    std::unique_ptr<wchar_t*, local_free_t> argv_;
+    std::unique_ptr<wchar_t *, local_free_t> argv_;
 };
 
-std::wstring find_in_path(std::wstring_view exe)
-{
+std::wstring find_in_path(std::wstring_view exe) {
     wchar_t result[MAX_PATH];
 
     DWORD success = ::SearchPathW(
-        nullptr, // lpPath
-        exe.data(), // lpFileName
-        nullptr, // lpExtension
+        nullptr,                   // lpPath
+        exe.data(),                // lpFileName
+        nullptr,                   // lpExtension
         std::ranges::size(result), // nBufferLength
-        result, // lpBuffer
-        nullptr // lpFilePart
+        result,                    // lpBuffer
+        nullptr                    // lpFilePart
     );
 
     if(success == 0) {
@@ -97,28 +75,26 @@ std::wstring find_in_path(std::wstring_view exe)
     return result;
 }
 
-std::wstring quote(std::wstring_view str)
-{
+std::wstring quote(std::wstring_view str) {
     wchar_t result[MAX_PATH];
 
     // `>=` because `size()` returns the size without the trailing zero
-    if(str.size() >= std::ranges::size(result)) {
+    if(std::ranges::size(str) >= std::ranges::size(result)) {
         throw std::runtime_error{"The argument is too big"};
     }
 
     auto [_, last] = std::ranges::copy(str, std::ranges::begin(result));
-    *last = '\0';
+    *last          = '\0';
     (void)::PathQuoteSpacesW(result);
     return result;
 }
 
 template<std::ranges::range Range>
-std::wstring join(const Range& rng)
-{
+std::wstring join(const Range &rng) {
     std::wstring ret;
 
     bool first = true;
-    for(const auto& string : rng) {
+    for(const auto &string : rng) {
         if(!std::exchange(first, false)) {
             ret += L' ';
         }
@@ -129,55 +105,59 @@ std::wstring join(const Range& rng)
     return ret;
 }
 
-int main()
-try {
-    if(!::SetSearchPathMode(BASE_SEARCH_PATH_ENABLE_SAFE_SEARCHMODE | BASE_SEARCH_PATH_PERMANENT)) {
+void set_sane_winapi_defaults() {
+    constexpr auto search_path_mode_flags =
+        BASE_SEARCH_PATH_ENABLE_SAFE_SEARCHMODE | BASE_SEARCH_PATH_PERMANENT;
+
+    if(!::SetSearchPathMode(search_path_mode_flags)) {
         throw errno_exception_t{};
     }
+}
+
+int main() try {
+    set_sane_winapi_defaults();
 
     constexpr std::wstring_view app_name = L"nvim-qt.exe";
-
-    const std::wstring app_path = find_in_path(app_name);
+    const std::wstring app_path          = find_in_path(app_name);
 
     const argv_t argv{::GetCommandLineW()};
-    const auto my_cmd = argv.sv_span();
-    const auto arguments = my_cmd | std::views::drop(1)
-                                  | std::views::transform(&quote);
+    // clang-format off
+    const auto arguments = argv.get_span() | std::views::drop(1)
+                                           | std::views::transform(quote);
+    // clang-format on
 
     // `::CreateProcessW` may modify the contents of this variable
-    std::wstring nvim_cmd = arguments.empty() ? quote(app_path)
-                                              : std::format(L"{} -- {}", quote(app_path), join(arguments))
-    ;
+    std::wstring nvim_cmd =
+        std::ranges::empty(arguments)
+            ? quote(app_path)
+            : std::format(L"{} -- {}", quote(app_path), join(arguments));
 
     STARTUPINFOW startup_info{};
-    startup_info.cb = sizeof(startup_info);
+    startup_info.cb          = sizeof(startup_info);
     startup_info.wShowWindow = true;
-    startup_info.dwFlags = STARTF_USESHOWWINDOW;
+    startup_info.dwFlags     = STARTF_USESHOWWINDOW;
 
     PROCESS_INFORMATION process_info;
 
     bool res = ::CreateProcessW(
         app_path.data(), // lpApplicationName
         nvim_cmd.data(), // lpCommandLine
-        nullptr, // lpProcessAttributes
-        nullptr, // lpThreadAttributes
-        false, // bInheritHandles
-        0, // dwCreationFlags
-        nullptr, // lpEnvironment
-        nullptr, // lpCurrentDirectory
-        &startup_info, // lpStartupInfo
-        &process_info // lpProcessInformation
+        nullptr,         // lpProcessAttributes
+        nullptr,         // lpThreadAttributes
+        false,           // bInheritHandles
+        0,               // dwCreationFlags
+        nullptr,         // lpEnvironment
+        nullptr,         // lpCurrentDirectory
+        &startup_info,   // lpStartupInfo
+        &process_info    // lpProcessInformation
     );
 
     if(!res) {
-        std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-        std::string error_msg = make_ec().message();
-        std::wstring wide_error_msg = converter.from_bytes(error_msg);
-        std::wcerr << "Cannot start " << std::quoted(nvim_cmd) << ": " << wide_error_msg << std::endl;
+        throw errno_exception_t{};
     }
 
     return 0;
-} catch(const std::exception& ex) {
+} catch(const std::exception &ex) {
     std::cerr << "nvim-qt wrapper error: " << ex.what() << std::endl;
     return 1;
 }
